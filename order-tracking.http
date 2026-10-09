@@ -1,0 +1,525 @@
+# ============================================================
+# Order Tracking API - ไฟล์ทดสอบ
+#
+# ใช้กับ VS Code ส่วนเสริม "REST Client" (humao.rest-client)
+# กดคำว่า "Send Request" เหนือแต่ละคำขอ หรือวางเคอร์เซอร์แล้วกด Ctrl+Alt+R
+#
+# - รัน API ก่อน:  docker compose up --build
+# - ไฟล์นี้เรียงเป็นลำดับ รันจากบนลงล่างได้เลย: สร้างออเดอร์ แล้วนำเลขออเดอร์ที่ได้ไปใช้ในคำขอถัดไป
+# - ทุกคำขอมีบรรทัด "Expect" บอกผลที่ควรได้
+# - Idempotency-Key ใช้ {{$timestamp}} จึงรันซ้ำกี่รอบก็ได้ออเดอร์ใหม่ทุกครั้ง
+#
+# มี "ขั้นตอนที่ต้องทำด้วยมือ" 2 จุด (ค้นหาด้วยคำว่า MANUAL):
+#   ลายเซ็น webhook คำนวณจาก raw body ซึ่ง REST Client คำนวณ HMAC เองไม่ได้
+#   ให้รัน  npm run sign -- <เลขออเดอร์>  แล้ววางค่า X-Signature ลงใน @signatureA / @signatureB
+#
+# - token ด้านล่างเป็นค่าเริ่มต้นของ docker-compose.yml ถ้าตั้งค่าเองใน .env ให้แก้ให้ตรงกัน
+# - ถ้ารันซ้ำหลายรอบ แล้ว bot claim ได้ออเดอร์ค้างจากรอบก่อน ให้ล้างข้อมูลด้วย
+#   docker compose down -v && docker compose up --build
+# - ใช้ client อื่น (เช่น JetBrains) ที่ไม่รองรับ {{createOrderA.response...}}
+#   ให้แทนด้วยเลขออเดอร์จริงจากผลของคำขอ "สร้างออเดอร์"
+# ============================================================
+
+@baseUrl = http://localhost:3000
+@botToken = dev-bot-token-change-me
+@adminToken = dev-admin-token-change-me
+@botId = http-bot-1
+
+# MANUAL: วางค่า "sha256=..." ที่ได้จาก  npm run sign -- <เลขออเดอร์>
+@signatureA = sha256=REPLACE_WITH_SIGNATURE_OF_ORDER_A
+@signatureB = sha256=REPLACE_WITH_SIGNATURE_OF_ORDER_B
+
+@orderA = {{createOrderA.response.body.$.data.orderNo}}
+@orderB = {{createOrderB.response.body.$.data.orderNo}}
+
+
+### ------------------------------------------------------------
+### 0. Health check
+### ------------------------------------------------------------
+
+# Expect: 200  {"status":"ok","db":"up"}
+GET {{baseUrl}}/health
+
+
+### ------------------------------------------------------------
+### 1. POST /orders  สร้างออเดอร์ (ต้องมี Idempotency-Key)
+### ------------------------------------------------------------
+
+### สร้างออเดอร์ A (สถานะเริ่มต้น PENDING_PAYMENT ให้เวลาจ่าย 15 นาที)
+# @name createOrderA
+# Expect: 201  (orderNo รูปแบบ ORD-<13 หลัก>-<3 หลัก>, status PENDING_PAYMENT)
+POST {{baseUrl}}/orders
+Content-Type: application/json
+Idempotency-Key: http-a-{{$timestamp}}
+
+{
+  "customerRef": "http-demo",
+  "gameCode": "freefire",
+  "gameUid": "uid-12345",
+  "packageCode": "diamonds",
+  "amount": 35,
+  "currency": "THB"
+}
+
+
+### ส่งซ้ำด้วย Idempotency-Key เดิม + ข้อมูลเดิม (เช่น ลูกค้ากดซ้ำ / เน็ตหลุดแล้วส่งใหม่)
+# Expect: 201  ได้ออเดอร์เลขเดิม ไม่สร้างใหม่ และมี header  Idempotent-Replayed: true
+POST {{baseUrl}}/orders
+Content-Type: application/json
+Idempotency-Key: {{createOrderA.request.headers.Idempotency-Key}}
+
+{
+  "customerRef": "http-demo",
+  "gameCode": "freefire",
+  "gameUid": "uid-12345",
+  "packageCode": "diamonds",
+  "amount": 35,
+  "currency": "THB"
+}
+
+
+### Idempotency-Key เดิม แต่ข้อมูลต่างกัน
+# Expect: 422  IDEMPOTENCY_KEY_REUSED
+POST {{baseUrl}}/orders
+Content-Type: application/json
+Idempotency-Key: {{createOrderA.request.headers.Idempotency-Key}}
+
+{
+  "customerRef": "http-demo",
+  "gameCode": "freefire",
+  "gameUid": "uid-12345",
+  "packageCode": "diamonds",
+  "amount": 999,
+  "currency": "THB"
+}
+
+
+### ไม่ส่ง Idempotency-Key
+# Expect: 400  MISSING_IDEMPOTENCY_KEY
+POST {{baseUrl}}/orders
+Content-Type: application/json
+
+{
+  "customerRef": "http-demo",
+  "gameCode": "freefire",
+  "gameUid": "uid-12345",
+  "packageCode": "diamonds",
+  "amount": 35
+}
+
+
+### ข้อมูลผิดหลายฟิลด์พร้อมกัน
+# Expect: 400  VALIDATION_ERROR (details แจ้งทุกฟิลด์ที่ผิดในครั้งเดียว)
+POST {{baseUrl}}/orders
+Content-Type: application/json
+Idempotency-Key: http-bad-{{$timestamp}}
+
+{
+  "gameCode": "Free Fire!",
+  "gameUid": "uid 123",
+  "amount": -5
+}
+
+
+### JSON ผิดรูปแบบ
+# Expect: 400  INVALID_JSON
+POST {{baseUrl}}/orders
+Content-Type: application/json
+Idempotency-Key: http-json-{{$timestamp}}
+
+{ "customerRef": "broken",
+
+
+### ------------------------------------------------------------
+### 2. GET /orders/:orderNo  ค้นหาด้วยเลขออเดอร์
+### ------------------------------------------------------------
+
+### ดูออเดอร์ A
+# Expect: 200  (status PENDING_PAYMENT)
+GET {{baseUrl}}/orders/{{orderA}}
+
+
+### รูปแบบเลขออเดอร์ผิด
+# Expect: 400  INVALID_ORDER_NO (details มี example)
+GET {{baseUrl}}/orders/ORD-123
+
+
+### รูปแบบถูกแต่ไม่มีในระบบ
+# Expect: 404  ORDER_NOT_FOUND
+GET {{baseUrl}}/orders/ORD-0000000000000-000
+
+
+### ------------------------------------------------------------
+### 3. GET /orders  รายการออเดอร์ (current | history) ใหม่ไปเก่า แบ่งหน้า
+### ------------------------------------------------------------
+
+### แท็บ "ปัจจุบัน" ของลูกค้า http-demo
+# Expect: 200  (มีออเดอร์ A; pagination: tab, page, pageSize, total, totalPages)
+GET {{baseUrl}}/orders?tab=current&page=1&pageSize=20&customerRef=http-demo
+
+
+### แท็บ "ที่ผ่านมา"
+# Expect: 200  (ตอนนี้ยังว่างหรือมีเฉพาะออเดอร์ COMPLETED / EXPIRED / REFUNDED จากรอบก่อน)
+GET {{baseUrl}}/orders?tab=history&page=1&pageSize=20&customerRef=http-demo
+
+
+### tab ไม่ถูกต้อง
+# Expect: 400  VALIDATION_ERROR
+GET {{baseUrl}}/orders?tab=all
+
+
+### pageSize เกิน 100
+# Expect: 400  VALIDATION_ERROR
+GET {{baseUrl}}/orders?pageSize=101
+
+
+### ------------------------------------------------------------
+### 4. GET /orders/:orderNo/timeline  และ POST .../report-issue
+### ------------------------------------------------------------
+
+### ประวัติการเปลี่ยนสถานะของออเดอร์ A
+# Expect: 200  (events มี ORDER_CREATED เป็นรายการแรก)
+GET {{baseUrl}}/orders/{{orderA}}/timeline
+
+
+### ลูกค้าแจ้งปัญหา (ไม่เปลี่ยนสถานะ แต่บันทึกใน timeline และสร้าง alert ให้แอดมิน)
+# Expect: 201  (status ยังเป็น PENDING_PAYMENT)
+POST {{baseUrl}}/orders/{{orderA}}/report-issue
+Content-Type: application/json
+
+{
+  "category": "PAYMENT_PROBLEM",
+  "message": "โอนเงินแล้วแต่สถานะยังไม่เปลี่ยน"
+}
+
+
+### category ไม่อยู่ในรายการ
+# Expect: 400  VALIDATION_ERROR (category ต้องเป็น NOT_RECEIVED, WRONG_UID, PAYMENT_PROBLEM, OTHER)
+POST {{baseUrl}}/orders/{{orderA}}/report-issue
+Content-Type: application/json
+
+{
+  "category": "ANGRY",
+  "message": "ช้ามาก"
+}
+
+
+### ------------------------------------------------------------
+### 5. POST /webhooks/payment  ธนาคารแจ้งจ่ายเงินสำเร็จ (เคส 3)
+###
+### MANUAL ครั้งที่ 1: ในเทอร์มินัลรัน   npm run sign -- <เลขออเดอร์ A>
+###   แล้ววางค่า X-Signature ลงใน @signatureA ด้านบนไฟล์ (ใช้ body ตามที่สคริปต์พิมพ์ ตรงกับ body ด้านล่าง)
+###   ห้ามแก้ช่องว่างหรือลำดับ key ใน body หลังสร้างลายเซ็น เพราะลายเซ็นตรวจกับ raw body ทุกไบต์
+### ------------------------------------------------------------
+
+### ไม่ส่งลายเซ็น
+# Expect: 401  INVALID_SIGNATURE
+POST {{baseUrl}}/webhooks/payment
+Content-Type: application/json
+
+{"eventId":"evt-{{orderA}}","type":"payment.succeeded","orderNo":"{{orderA}}","paymentRef":"pay-{{orderA}}","amount":35,"currency":"THB"}
+
+
+### ลายเซ็นผิด
+# Expect: 401  INVALID_SIGNATURE
+POST {{baseUrl}}/webhooks/payment
+Content-Type: application/json
+X-Signature: sha256=0000000000000000000000000000000000000000000000000000000000000000
+
+{"eventId":"evt-{{orderA}}","type":"payment.succeeded","orderNo":"{{orderA}}","paymentRef":"pay-{{orderA}}","amount":35,"currency":"THB"}
+
+
+### จ่ายเงินสำเร็จ (ลายเซ็นถูกต้อง)
+# Expect: 200  outcome APPLIED  (ออเดอร์ A เปลี่ยน PENDING_PAYMENT -> QUEUED)
+POST {{baseUrl}}/webhooks/payment
+Content-Type: application/json
+X-Signature: {{signatureA}}
+
+{"eventId":"evt-{{orderA}}","type":"payment.succeeded","orderNo":"{{orderA}}","paymentRef":"pay-{{orderA}}","amount":35,"currency":"THB"}
+
+
+### ธนาคารส่ง webhook เดิมซ้ำ (eventId เดียวกัน)
+# Expect: 200  outcome DUPLICATE_EVENT  (ไม่ประมวลผลซ้ำ ไม่มี event เพิ่มใน timeline)
+POST {{baseUrl}}/webhooks/payment
+Content-Type: application/json
+X-Signature: {{signatureA}}
+
+{"eventId":"evt-{{orderA}}","type":"payment.succeeded","orderNo":"{{orderA}}","paymentRef":"pay-{{orderA}}","amount":35,"currency":"THB"}
+
+
+### ตรวจสถานะหลังจ่ายเงิน
+# Expect: 200  (status QUEUED, paidAt มีค่า)
+GET {{baseUrl}}/orders/{{orderA}}
+
+
+### ------------------------------------------------------------
+### 6. /bot  bot รับงาน -> ต่อ lease -> เติมสำเร็จ (เคส 1, 2)
+###    ทุกคำขอต้องมี X-Bot-Token และ X-Bot-Id
+### ------------------------------------------------------------
+
+### ไม่ส่ง token
+# Expect: 401  UNAUTHORIZED
+POST {{baseUrl}}/bot/orders/claim
+X-Bot-Id: {{botId}}
+
+
+### ไม่ส่ง X-Bot-Id
+# Expect: 400  VALIDATION_ERROR
+POST {{baseUrl}}/bot/orders/claim
+X-Bot-Token: {{botToken}}
+
+> {% client.test("missing X-Bot-Id is rejected with validation error", function() {
+  client.assert(response.status === 400, "Expected HTTP 400 for missing X-Bot-Id");
+  client.assert(response.body && response.body.error && response.body.error.code === "VALIDATION_ERROR", "Expected VALIDATION_ERROR");
+}); %}
+
+
+### bot รับงานจากคิว (atomic: FOR UPDATE SKIP LOCKED) ได้ lease 120 วินาที
+# @name claimA
+# Expect: 200  (data.orderNo คือออเดอร์ A, attemptNo 1, leaseExpiresAt; ออเดอร์เปลี่ยนเป็น IN_PROGRESS)
+#         ถ้าคิวว่างได้ {"data":null}
+POST {{baseUrl}}/bot/orders/claim
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+
+
+### bot ตัวอื่นพยายามต่อ lease ของงานที่ไม่ได้ถือ
+# Expect: 409  BOT_LEASE_NOT_OWNED
+POST {{baseUrl}}/bot/orders/{{claimA.response.body.$.data.orderNo}}/heartbeat
+X-Bot-Token: {{botToken}}
+X-Bot-Id: intruder-bot
+
+
+### bot เจ้าของงานส่ง heartbeat ต่อ lease
+# Expect: 200  (leaseExpiresAt ใหม่)
+POST {{baseUrl}}/bot/orders/{{claimA.response.body.$.data.orderNo}}/heartbeat
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+
+
+### bot ตัวอื่นพยายามปิดงาน
+# Expect: 409  BOT_LEASE_NOT_OWNED
+POST {{baseUrl}}/bot/orders/{{claimA.response.body.$.data.orderNo}}/complete
+X-Bot-Token: {{botToken}}
+X-Bot-Id: intruder-bot
+
+
+### bot เจ้าของงานเติมเกมสำเร็จ
+# Expect: 200  (status COMPLETED)
+POST {{baseUrl}}/bot/orders/{{claimA.response.body.$.data.orderNo}}/complete
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+
+
+### ปิดงานซ้ำ
+# Expect: 409  BOT_LEASE_NOT_OWNED  (ออเดอร์ไม่ได้อยู่ใน IN_PROGRESS แล้ว)
+POST {{baseUrl}}/bot/orders/{{claimA.response.body.$.data.orderNo}}/complete
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+
+
+### timeline ทั้งเส้นของออเดอร์ A
+# Expect: 200  ORDER_CREATED, ISSUE_REPORTED, PAYMENT_CONFIRMED, BOT_CLAIMED, BOT_COMPLETED
+#         (BOT_HEARTBEAT ไม่แสดงใน timeline)
+GET {{baseUrl}}/orders/{{orderA}}/timeline
+
+
+### ------------------------------------------------------------
+### 7. ออเดอร์ B: เติมไม่สำเร็จ (เคส 4) และ retry แบบ backoff (เคส 1)
+###    UID ผิด -> FAILED -> แก้ UID -> transient error -> backoff -> permanent -> ขอคืนเงิน -> แอดมินยืนยัน
+### ------------------------------------------------------------
+
+### สร้างออเดอร์ B (ใส่ UID ผิดไว้ตั้งใจ)
+# @name createOrderB
+# Expect: 201
+POST {{baseUrl}}/orders
+Content-Type: application/json
+Idempotency-Key: http-b-{{$timestamp}}
+
+{
+  "customerRef": "http-demo",
+  "gameCode": "freefire",
+  "gameUid": "uid-wrong-0001",
+  "packageCode": "diamonds",
+  "amount": 35,
+  "currency": "THB"
+}
+
+
+### MANUAL ครั้งที่ 2: รัน   npm run sign -- <เลขออเดอร์ B>   แล้ววางค่าลงใน @signatureB ด้านบนไฟล์
+### จ่ายเงินออเดอร์ B
+# Expect: 200  outcome APPLIED  (QUEUED)
+POST {{baseUrl}}/webhooks/payment
+Content-Type: application/json
+X-Signature: {{signatureB}}
+
+{"eventId":"evt-{{orderB}}","type":"payment.succeeded","orderNo":"{{orderB}}","paymentRef":"pay-{{orderB}}","amount":35,"currency":"THB"}
+
+
+### bot รับงาน B
+# @name claimB1
+# Expect: 200  (orderNo ของ B, attemptNo 1)
+POST {{baseUrl}}/bot/orders/claim
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+
+
+### bot รายงาน error แบบ PERMANENT (UID ผิด) ลองใหม่ไปก็ไม่หาย
+# Expect: 200  status FAILED  (ไม่ retry อัตโนมัติ และเหตุผลบันทึกใน timeline)
+POST {{baseUrl}}/bot/orders/{{claimB1.response.body.$.data.orderNo}}/fail
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+Content-Type: application/json
+
+{
+  "errorType": "PERMANENT",
+  "errorCode": "WRONG_UID",
+  "message": "ไม่พบผู้เล่นตาม UID นี้"
+}
+
+
+### ลูกค้าส่ง UID เดิมซ้ำ
+# Expect: 422  UID_UNCHANGED
+PATCH {{baseUrl}}/orders/{{orderB}}/uid
+Content-Type: application/json
+
+{
+  "gameUid": "uid-wrong-0001"
+}
+
+
+### ลูกค้าแก้ UID แล้วให้ลองใหม่
+# Expect: 200  status QUEUED  (retry นับใหม่จากศูนย์ และ error เดิมถูกล้าง)
+PATCH {{baseUrl}}/orders/{{orderB}}/uid
+Content-Type: application/json
+
+{
+  "gameUid": "uid-correct-0002"
+}
+
+
+### ขอคืนเงินตอนที่ออเดอร์ไม่ใช่ FAILED / DELAYED
+# Expect: 409  REFUND_NOT_ALLOWED
+POST {{baseUrl}}/orders/{{orderB}}/refund-request
+
+
+### bot รับงาน B อีกครั้ง
+# @name claimB2
+# Expect: 200  (attemptNo 2)
+POST {{baseUrl}}/bot/orders/claim
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+
+
+### bot รายงาน error แบบ TRANSIENT (provider ไม่ตอบ)
+# Expect: 200  status QUEUED  (กลับคิวพร้อมหน่วง 30 วินาที; ครบ 3 ครั้งแล้วพลาดอีกจะเป็น DELAYED + alert)
+POST {{baseUrl}}/bot/orders/{{claimB2.response.body.$.data.orderNo}}/fail
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+Content-Type: application/json
+
+{
+  "errorType": "TRANSIENT",
+  "errorCode": "PROVIDER_TIMEOUT",
+  "message": "ผู้ให้บริการไม่ตอบกลับ"
+}
+
+
+### ลอง claim ทันที (ยังไม่ถึงเวลา retry)
+# Expect: 200  {"data":null}  (ถ้ามีออเดอร์ค้างจากรอบก่อน อาจได้ออเดอร์อื่นแทน)
+POST {{baseUrl}}/bot/orders/claim
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+
+
+### รอ 30 วินาที (RETRY_BASE_SECONDS) แล้ว claim อีกครั้ง
+# @name claimB3
+# Expect: 200  (ได้ออเดอร์ B ที่ attemptNo 3)
+POST {{baseUrl}}/bot/orders/claim
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+
+
+### bot รายงาน PERMANENT อีกรอบ
+# Expect: 200  status FAILED
+POST {{baseUrl}}/bot/orders/{{claimB3.response.body.$.data.orderNo}}/fail
+X-Bot-Token: {{botToken}}
+X-Bot-Id: {{botId}}
+Content-Type: application/json
+
+{
+  "errorType": "PERMANENT",
+  "errorCode": "ACCOUNT_BANNED",
+  "message": "บัญชีเกมถูกระงับ เติมไม่ได้"
+}
+
+
+### ลูกค้าขอคืนเงิน
+# Expect: 200  status REFUND_PENDING  (สร้าง alert REFUND_REQUESTED ให้แอดมิน)
+POST {{baseUrl}}/orders/{{orderB}}/refund-request
+
+
+### ------------------------------------------------------------
+### 8. /admin  แอดมิน (ต้องมี X-Admin-Token)
+### ------------------------------------------------------------
+
+### ไม่ส่ง token
+# Expect: 401  UNAUTHORIZED
+GET {{baseUrl}}/admin/alerts
+
+
+### ดู alert ที่ยังไม่รับทราบ (ใหม่ไปเก่า)
+# @name alerts
+# Expect: 200  (มี CUSTOMER_REPORT จากข้อ 4 และ REFUND_REQUESTED ของออเดอร์ B)
+GET {{baseUrl}}/admin/alerts?status=open&limit=50
+X-Admin-Token: {{adminToken}}
+
+
+### รับทราบ alert ล่าสุด
+# Expect: 200  (acknowledgedAt มีค่า กดซ้ำได้ผลเหมือนเดิม)
+POST {{baseUrl}}/admin/alerts/{{alerts.response.body.$.data[0].id}}/acknowledge
+X-Admin-Token: {{adminToken}}
+
+
+### alert ที่ไม่มีอยู่
+# Expect: 404  ALERT_NOT_FOUND
+POST {{baseUrl}}/admin/alerts/999999999/acknowledge
+X-Admin-Token: {{adminToken}}
+
+
+### แอดมินยืนยันว่าคืนเงินออเดอร์ B แล้ว (ระบบไม่ได้โอนเงินเอง)
+# Expect: 200  status REFUNDED
+POST {{baseUrl}}/admin/orders/{{orderB}}/refund
+X-Admin-Token: {{adminToken}}
+
+
+### ยืนยันคืนเงินซ้ำ
+# Expect: 409  REFUND_NOT_PENDING
+POST {{baseUrl}}/admin/orders/{{orderB}}/refund
+X-Admin-Token: {{adminToken}}
+
+
+### requeue ออเดอร์ที่จบแล้ว
+# Expect: 409  REQUEUE_NOT_ALLOWED  (requeue ได้เฉพาะ DELAYED / FAILED)
+POST {{baseUrl}}/admin/orders/{{orderB}}/requeue
+X-Admin-Token: {{adminToken}}
+
+
+### สั่งรัน scheduler หนึ่งรอบ (เคส 5: หมดเวลาจ่ายเงิน, ดึง lease คืน, alert คิวค้าง) รันซ้ำได้ปลอดภัย
+# หมายเหตุ: อยากเห็น PENDING_PAYMENT -> EXPIRED ให้ตั้ง PAYMENT_TTL_MINUTES=1 ใน .env แล้วสร้างออเดอร์ทิ้งไว้ 1 นาที
+# Expect: 200  (expiredPayments, reclaimedLeases มี processed / skipped / failed; queueSlaAlerts มี created)
+POST {{baseUrl}}/admin/scheduler/run
+X-Admin-Token: {{adminToken}}
+
+
+### timeline ทั้งเส้นของออเดอร์ B
+# Expect: 200  ORDER_CREATED, PAYMENT_CONFIRMED, BOT_CLAIMED, BOT_FAILED, UID_UPDATED, ... REFUND_REQUESTED, REFUND_COMPLETED
+GET {{baseUrl}}/orders/{{orderB}}/timeline
+
+
+### ------------------------------------------------------------
+### 9. Route ที่ไม่มีอยู่
+### ------------------------------------------------------------
+
+# Expect: 404  ROUTE_NOT_FOUND
+GET {{baseUrl}}/nothing

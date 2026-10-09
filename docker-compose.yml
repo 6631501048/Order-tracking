@@ -1,0 +1,50 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders_pass
+      POSTGRES_DB: orders_db
+    ports:
+      - "5433:5432"   # 5433 กันชนกับ Postgres ของข้อ 1 / เครื่อง local
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: 3000
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: orders
+      DB_PASSWORD: orders_pass
+      DB_NAME: orders_db
+      RUN_MIGRATIONS: "true"
+      PAYMENT_TTL_MINUTES: ${PAYMENT_TTL_MINUTES:-15}
+      # ค่าเริ่มต้นสำหรับ dev/demo เพื่อให้ `docker compose up` ใช้งาน bot/admin/webhook ได้ทันที
+      # !! ต้องเปลี่ยนก่อนใช้งานจริง (ตั้งผ่าน .env หรือ environment) !!
+      BOT_TOKEN: ${BOT_TOKEN:-dev-bot-token-change-me}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token-change-me}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-dev-webhook-secret-change-me}
+      BOT_LEASE_SECONDS: ${BOT_LEASE_SECONDS:-120}
+      BOT_MAX_RETRIES: ${BOT_MAX_RETRIES:-3}
+      RETRY_BASE_SECONDS: ${RETRY_BASE_SECONDS:-30}
+      RETRY_MAX_DELAY_SECONDS: ${RETRY_MAX_DELAY_SECONDS:-900}
+      QUEUE_SLA_SECONDS: ${QUEUE_SLA_SECONDS:-600}
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-true}
+      SCHEDULER_INTERVAL_SECONDS: ${SCHEDULER_INTERVAL_SECONDS:-15}
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:
