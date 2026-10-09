@@ -1,0 +1,23 @@
+# Render Blueprint: New > Blueprint > เลือก repo นี้
+services:
+  - type: web
+    name: order-tracking
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: order-tracking-db
+          property: connectionString
+      - key: RUN_MIGRATIONS
+        value: "true"
+      - key: BOT_TOKEN
+        generateValue: true
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: WEBHOOK_SECRET
+        generateValue: true
+databases:
+  - name: order-tracking-db
+    plan: free
